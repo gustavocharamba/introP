@@ -1,110 +1,80 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from PySpice.Spice.Netlist import Circuit
 from PySpice.Unit import *
 
-# ==============================================
-# Configuração do Circuito RC para caracterização
-# ==============================================
-
-circuit = Circuit("Medidor de Capacitância Dinâmico")
-
-# Parâmetros do circuito
-R_value = 10 @ u_kΩ  # Resistência padrão de referência
-C_real = 1 @ u_nF    # Valor real usado na simulação
-
-# Configuração da fonte de pulso retangular
-circuit.PulseVoltageSource('input', 'vin', circuit.gnd,
-                           initial_value=0 @ u_V,
-                           pulsed_value=5 @ u_V,
-                           pulse_width=15 @ u_ms,
-                           period=30 @ u_ms,
-                           rise_time=1 @ u_ns,
-                           fall_time=1 @ u_ns)
-
-circuit.R(1, 'vin', 'vout', R_value)
-circuit.C(1, 'vout', circuit.gnd, C_real)
-
-# ==============================================
-# Simulação do Comportamento Dinâmico
-# ==============================================
-
-simulator = circuit.simulator()
-analysis = simulator.transient(step_time=10 @ u_us, end_time=30 @ u_ms)
-
-# Extração de dados formatados para numpy
-time = np.array(analysis.time)
-voltage_out = np.array(analysis['vout'])
-
-# ==============================================
-# Modelo Matemático e Ajuste de Curva
-# ==============================================
-
 def modelo_carregamento(t, tau, V_max):
-    """Modelo teórico de carga do capacitor"""
     return V_max * (1 - np.exp(-t / tau))
 
-# Seleciona janela de análise (exclui transientes iniciais)
-janela_analise = (time >= 0.001) & (time <= 0.015)  # Ajuste para a região de carga
-time_ajuste = time[janela_analise]
-voltage_ajuste = voltage_out[janela_analise]
+def medir_capacitancia(R_valor_ohm, C_real_farads, V_pulso=5, periodo_inicial=0.03):
+    erro_alvo = 2.0  # erro alvo (%)
+    erro_atual = 100.0
+    periodo = periodo_inicial
+    max_iter = 15
+    tentativa = 0
 
-# Estimativa inicial inteligente (R*C típico para 1µF = 10ms)
-R_ohm = float(R_value)
-chute_inicial = [R_ohm * 1e-6, 5]  # Assume ~1µF como estimativa
+    while erro_atual > erro_alvo and tentativa < max_iter:
+        tentativa += 1
 
-# Executa ajuste não-linear
-param_otimos, covariancia = curve_fit(modelo_carregamento,
-                                      time_ajuste, voltage_ajuste,
-                                      p0=chute_inicial,
-                                      maxfev=5000)
+        circuit = Circuit("Ajuste Automático de Período")
+        circuit.PulseVoltageSource('input', 'vin', circuit.gnd,
+                                   initial_value=0 @ u_V,
+                                   pulsed_value=V_pulso @ u_V,
+                                   pulse_width=(periodo / 2) @ u_s,
+                                   period=periodo @ u_s,
+                                   rise_time=1 @ u_ns,
+                                   fall_time=1 @ u_ns)
+        circuit.R(1, 'vin', 'vout', R_valor_ohm @ u_Ω)
+        circuit.C(1, 'vout', circuit.gnd, C_real_farads @ u_F)
 
-tau_estimado = param_otimos[0]
-Vmax_estimado = param_otimos[1]
-C_estimado = tau_estimado / R_ohm
+        simulator = circuit.simulator()
+        analysis = simulator.transient(step_time=10 @ u_us, end_time=periodo @ u_s)
 
-# Calcula incertezas
-erros = np.sqrt(np.diag(covariancia))
-incerteza_tau = erros[0]
-incerteza_C = incerteza_tau / R_ohm
+        time = np.array(analysis.time)
+        voltage_out = np.array(analysis['vout'])
 
-# ==============================================
-# Visualização Profissional dos Resultados
-# ==============================================
+        janela = (time >= 0.001) & (time <= periodo / 2)
+        time_ajuste = time[janela]
+        voltage_ajuste = voltage_out[janela]
 
-plt.style.use('seaborn-v0_8-notebook')
-fig, ax = plt.subplots(figsize=(12, 7), dpi=300)
+        chute_inicial = [R_valor_ohm * C_real_farads, V_pulso]
 
-# Plot dados brutos
-ax.plot(time, voltage_out, 'bo', markersize=4, alpha=0.6,
-        label='Dados Simulados', markeredgewidth=0)
+        try:
+            param_otimos, covariancia = curve_fit(modelo_carregamento,
+                                                  time_ajuste, voltage_ajuste,
+                                                  p0=chute_inicial,
+                                                  maxfev=5000)
 
-# Curva ajustada
-ax.plot(time, modelo_carregamento(time, *param_otimos),
-        'r-', linewidth=2.5,
-        label=f'Ajuste: τ = {tau_estimado:.4f} s\nC = {C_estimado:.2e} F ± {incerteza_C:.1e} F')
+            tau_estimado = param_otimos[0]
+            Vmax_estimado = param_otimos[1]
+            C_estimado = tau_estimado / R_valor_ohm
+            erro_atual = abs(C_estimado - C_real_farads) / C_real_farads * 100
+            razao_tau_periodo = tau_estimado / (periodo / 2)
 
-# Configurações do gráfico
-ax.set_title('Caracterização Dinâmica de Capacitor', fontsize=16)
-ax.set_xlabel('Tempo (s)', fontsize=14)
-ax.set_ylabel('Tensão (V)', fontsize=14)
-ax.grid(True, linestyle="--", alpha=0.7)
-ax.legend(fontsize=12)
-ax.set_xlim([0, 0.02])
-ax.set_ylim([-0.5, 5.5])
+            if erro_atual <= erro_alvo and 0.3 <= razao_tau_periodo <= 0.9:
+                break
 
-plt.tight_layout()
-plt.show()
+            if razao_tau_periodo > 0.9:
+                periodo *= 1.2
+            elif razao_tau_periodo < 0.3:
+                periodo *= 0.8
+            else:
+                periodo *= 1.05
 
-# ==============================================
-# Saída Numérica Detalhada
-# ==============================================
+        except RuntimeError:
+            periodo *= 1.2
+            continue
 
-erro_relativo = abs(C_estimado - float(C_real)) * 1e6
+    print(f'''\n{' RESULTADO DA MEDIÇÃO ':=^70}
+Tentativas Necessárias: {tentativa}
+Resistência: {R_valor_ohm:.0f} Ω
+Tensão de Pulso: {V_pulso:.2f} V
+Período Final da Onda: {periodo:.4f} s
+Tau Estimado: {tau_estimado:.5e} s
+Capacitância Estimada: {C_estimado:.3e} F
+Erro Relativo: {erro_atual:.2f}%
+{'='*70}''')
 
-print(f'''\n{' RESULTADOS DA CARACTERIZAÇÃO ':=^70}
-Resistência de Referência: {float(R_value):.2f} {R_value.unit}
-Tau Estimado: {tau_estimado:.5f} s ± {incerteza_tau:.5f} s
-Capacitância Calculada: {C_estimado:.3e} F ± {incerteza_C:.1e} F
-Erro Relativo: {erro_relativo:.2f}%''')
+    return C_estimado, erro_atual, periodo
+
+medir_capacitancia(R_valor_ohm=10_000, C_real_farads=17e-9, V_pulso=3, periodo_inicial=0.02)
